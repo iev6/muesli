@@ -5636,9 +5636,11 @@ public final class MuesliController: NSObject {
         appState.meetingsNavigationState = .document(id)
     }
 
-    func showMeetingChat(meetingID: Int64? = nil) {
+    @discardableResult
+    func showMeetingChat(meetingID: Int64? = nil) -> Task<Void, Never>? {
         appState.searchQuery = ""; appState.selectedTab = .meetingChat; appState.meetingChatDocumentTarget = nil
-        if let id = meetingID { meetingChatCoordinator.createChat(scope: .init(selection: .meetings([id]))) }
+        if let id = meetingID { return Task { await meetingChatCoordinator.createChat(scope: .init(selection: .meetings([id]))) } }
+        return nil
     }
     func showMeetingChatSource(_ target: MeetingChatDocumentTarget) {
         guard meeting(id: target.citation.meetingID) != nil else { meetingChatCoordinator.errorMessage = "This source meeting is no longer available."; return }

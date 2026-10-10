@@ -6,6 +6,22 @@ private actor MeetingChatWorker {
     let store: MeetingChatStore
     let retrieval: MeetingChatRetrieval
     init(databaseURL: URL) { store = .init(databaseURL: databaseURL); retrieval = .init(databaseURL: databaseURL) }
+    func interruptPendingTurns() throws { try store.interruptPendingTurns() }
+    func createChat(scope: MeetingChatScope) throws -> MeetingChatSession { try store.createSession(scope: scope, title: "New chat") }
+    func updateSession(id: UUID, title: String? = nil, scope: MeetingChatScope? = nil) throws { try store.updateSession(id: id, title: title, scope: scope) }
+    func beginTurn(sessionID: UUID, question: String, scope: MeetingChatScope, config: AppConfig, attemptID: UUID) throws -> MeetingChatTurn {
+        try store.beginTurn(sessionID: sessionID, question: question, scope: scope,
+            provider: MeetingSummaryBackendOption.resolved(config.meetingSummaryBackend).label,
+            model: MeetingTextGenerationClient.model(config), attemptID: attemptID)
+    }
+    func restartTurn(id: UUID, config: AppConfig) throws -> MeetingChatTurn? {
+        try store.restartTurn(id: id, provider: MeetingSummaryBackendOption.resolved(config.meetingSummaryBackend).label, model: MeetingTextGenerationClient.model(config))
+    }
+    func setTurnState(id: UUID, state: MeetingChatTurnState, error: String? = nil, attemptID: UUID?) throws {
+        try store.setTurnState(id: id, state: state, error: error, attemptID: attemptID)
+    }
+    func deleteChat(id: UUID) throws { try store.deleteSession(id: id) }
+    func saveDraft(turnID: UUID, text: String) throws { try store.saveDraft(turnID: turnID, text: text) }
     func warmIndex() throws { try retrieval.prepareIndex() }
     func choices() throws -> [MeetingChatSourceChoice] { try warmIndex(); return try store.sourceChoices() }
     func source(_ id: Int64) throws -> MeetingChatSourceSnapshot? { try store.sourceSnapshots(scope: .init(selection: .meetings([id]))).first }
@@ -69,6 +85,8 @@ final class MeetingChatCoordinator {
     @ObservationIgnored private let worker: MeetingChatWorker
     @ObservationIgnored private let generator: any MeetingTextGenerating
     @ObservationIgnored private var tasks: [UUID: Task<Void, Never>] = [:]
+    @ObservationIgnored private var initialization: Task<Void, Never>?
+    private var selectionVersion = UUID()
     private(set) var sessions: [MeetingChatSession] = []
     private(set) var hasChatHistory = false
     private(set) var turns: [MeetingChatTurn] = []
@@ -77,7 +95,11 @@ final class MeetingChatCoordinator {
     private(set) var activeTurnID: UUID?
     private var activeSessionID: UUID?
     private(set) var phase = ""
-    var composerDraft = ""
+    private var composerDrafts: [UUID?: String] = [:]
+    var composerDraft: String {
+        get { composerDrafts[selectedSessionID] ?? "" }
+        set { composerDrafts[selectedSessionID] = newValue }
+    }
     var errorMessage: String?
     var fastAnswers = true
     var scrollAnchors: [UUID: UUID] = [:]
@@ -85,59 +107,147 @@ final class MeetingChatCoordinator {
     private(set) var sourceChoices: [MeetingChatSourceChoice] = []
     var scope: MeetingChatScope { sessions.first { $0.id == selectedSessionID }?.scope ?? .init() }
     var isBusy: Bool { activeRequestID != nil }
+    private(set) var isUpdatingChat = false
 
     init(databaseURL: URL, generator: any MeetingTextGenerating = MeetingTextGenerationClient()) {
         store = .init(databaseURL: databaseURL); worker = .init(databaseURL: databaseURL); self.generator = generator
-        do { try store.interruptPendingTurns(); reload() } catch { errorMessage = error.localizedDescription }
+        reload()
         sourceMutationVersion = (try? store.sourceMutationVersion()) ?? 0
         let worker = worker
-        Task { do { sourceChoices = try await worker.choices() } catch { errorMessage = "Could not prepare meeting search. Retry by asking a question." } }
+        initialization = Task {
+            do { try await worker.interruptPendingTurns(); reload() }
+            catch { errorMessage = "Could not recover meeting chat history." }
+        }
+        Task {
+            await initialization?.value
+            do { sourceChoices = try await worker.choices() }
+            catch { errorMessage = "Could not prepare meeting search. Retry by asking a question." }
+        }
     }
     func reload() {
         do {
             sessions = try store.sessions()
             hasChatHistory = try store.hasChatHistory()
+            let sessionIDs = Set(sessions.map(\.id))
+            composerDrafts = composerDrafts.filter { $0.key == nil || sessionIDs.contains($0.key!) }
             if let id = selectedSessionID, sessions.contains(where: { $0.id == id }) { turns = try store.turns(sessionID: id) }
             else { selectedSessionID = nil; turns = [] }
         } catch { errorMessage = "Could not load meeting chat history." }
     }
-    func createChat(scope: MeetingChatScope) {
+    @discardableResult
+    func createChat(scope: MeetingChatScope) async -> UUID? {
+        guard !isUpdatingChat else { return nil }
+        isUpdatingChat = true
+        defer { isUpdatingChat = false }
+        let version = UUID(); selectionVersion = version
+        await initialization?.value
         do {
-            let session = try store.createSession(scope: scope, title: "New chat")
-            selectedSessionID = session.id; composerDraft = ""; errorMessage = nil; reload()
-        } catch { errorMessage = error.localizedDescription }
+            let session = try await worker.createChat(scope: scope)
+            if selectionVersion == version { selectedSessionID = session.id; errorMessage = nil }
+            reload()
+            return session.id
+        } catch { errorMessage = error.localizedDescription; return nil }
     }
-    func selectChat(id: UUID) { selectedSessionID = id; composerDraft = ""; errorMessage = nil; reload() }
-    func setScope(_ newScope: MeetingChatScope) {
-        if selectedSessionID == nil { createChat(scope: newScope); return }
-        do { try store.updateSession(id: selectedSessionID!, title: nil, scope: newScope); reload() }
-        catch { errorMessage = error.localizedDescription }
+    func selectChat(id: UUID) { selectionVersion = UUID(); selectedSessionID = id; errorMessage = nil; reload() }
+    @discardableResult
+    func setScope(_ newScope: MeetingChatScope) async -> UUID? {
+        if selectedSessionID == nil { return await createChat(scope: newScope) }
+        guard let id = selectedSessionID, !isUpdatingChat else { return nil }
+        isUpdatingChat = true
+        defer { isUpdatingChat = false }
+        do { try await worker.updateSession(id: id, scope: newScope); reload(); return id }
+        catch { errorMessage = error.localizedDescription; return nil }
     }
-    func renameChat(id: UUID, title: String) {
-        do { try store.updateSession(id: id, title: title, scope: nil); reload() } catch { errorMessage = error.localizedDescription }
+    func applyPreparedPrompt(_ prompt: MeetingChatPreparedPrompt) async -> Bool {
+        let target: UUID?
+        if prompt.scope != scope {
+            guard let id = await setScope(prompt.scope) else { return false }
+            target = id
+        } else { target = selectedSessionID }
+        guard selectedSessionID == target else { return false }
+        composerDraft = prompt.text
+        return true
     }
-    func send(question: String, config: AppConfig, isDraft: Bool = false) {
-        guard !isBusy else { return }
+    func renameChat(id: UUID, title: String) async {
+        do { try await worker.updateSession(id: id, title: title); reload() } catch { errorMessage = error.localizedDescription }
+    }
+    func send(question: String, config: AppConfig, isDraft: Bool = false) async {
+        guard !isBusy, !isUpdatingChat else { return }
         let question = question.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !question.isEmpty else { return }
         guard question.count <= 2_000 else { errorMessage = MeetingChatError.questionTooLong.localizedDescription; return }
-        if selectedSessionID == nil { createChat(scope: .init()) }
-        guard let id = selectedSessionID else { return }
+        let requestID = UUID()
+        activeRequestID = requestID; phase = "Saving question"
+        let draftKey = selectedSessionID; let submittedDraft = composerDraft
+        activeSessionID = draftKey
+        let requestScope = scope; let isFirstQuestion = turns.isEmpty
+        defer {
+            if activeRequestID == requestID, tasks[requestID] == nil {
+                activeRequestID = nil; activeTurnID = nil; activeSessionID = nil; phase = ""
+            }
+        }
+        await initialization?.value
+        guard activeRequestID == requestID, !Task.isCancelled else { return }
+        var requestSessionID = draftKey
+        var submittedDraftKey = draftKey
+        if requestSessionID == nil {
+            guard selectedSessionID == nil else { return }
+            requestSessionID = await createChat(scope: requestScope)
+            if let id = requestSessionID {
+                submittedDraftKey = id
+                // An implicit first send turns the untitled composer into this chat.
+                // Move its latest text, including edits or a Stop during registration.
+                if composerDrafts[id] == nil {
+                    composerDrafts[id] = composerDrafts[nil]
+                    composerDrafts[nil] = nil
+                }
+            }
+        }
+        guard activeRequestID == requestID, !Task.isCancelled, let id = requestSessionID else { return }
+        activeSessionID = id
         do {
             let requestConfig = fastAnswers ? MeetingTextGenerationClient.fastConfiguration(config) : config
-            let turn = try store.beginTurn(sessionID: id, question: question, scope: scope,
-                provider: MeetingSummaryBackendOption.resolved(requestConfig.meetingSummaryBackend).label, model: MeetingTextGenerationClient.model(requestConfig))
-            if turns.isEmpty { try store.updateSession(id: id, title: String(question.prefix(64)), scope: nil) }
-            composerDraft = ""; errorMessage = nil; reload(); launch(turn, config: requestConfig, isDraft: isDraft)
-        } catch { errorMessage = error.localizedDescription }
+            let turn = try await worker.beginTurn(sessionID: id, question: question, scope: requestScope, config: requestConfig, attemptID: requestID)
+            guard activeRequestID == requestID, !Task.isCancelled else {
+                try? await worker.setTurnState(id: turn.id, state: .stopped, attemptID: requestID)
+                reload(); return
+            }
+            activeTurnID = turn.id
+            if isFirstQuestion { try await worker.updateSession(id: id, title: String(question.prefix(64))) }
+            guard activeRequestID == requestID, !Task.isCancelled else {
+                try? await worker.setTurnState(id: turn.id, state: .stopped, attemptID: requestID)
+                reload(); return
+            }
+            if composerDrafts[submittedDraftKey] == submittedDraft, submittedDraft.trimmingCharacters(in: .whitespacesAndNewlines) == question { composerDrafts[submittedDraftKey] = nil }
+            errorMessage = nil; reload(); launch(turn, config: requestConfig, isDraft: isDraft)
+        } catch {
+            guard activeRequestID == requestID else { return }
+            if let turnID = activeTurnID { try? await worker.setTurnState(id: turnID, state: .failed, error: error.localizedDescription, attemptID: requestID) }
+            guard activeRequestID == requestID else { return }
+            activeRequestID = nil; activeTurnID = nil; activeSessionID = nil; phase = ""
+            errorMessage = error.localizedDescription; reload()
+        }
     }
-    func retry(turnID: UUID, config: AppConfig) {
-        guard !isBusy else { return }
+    func retry(turnID: UUID, config: AppConfig) async {
+        guard !isBusy, !isUpdatingChat else { return }
+        let reservation = UUID(); activeRequestID = reservation; phase = "Saving question"
+        activeSessionID = turns.first(where: { $0.id == turnID })?.sessionID
+        defer {
+            if activeRequestID == reservation { activeRequestID = nil; activeSessionID = nil; phase = "" }
+        }
         do {
             let requestConfig = fastAnswers ? MeetingTextGenerationClient.fastConfiguration(config) : config
-            guard let turn = try store.restartTurn(id: turnID, provider: MeetingSummaryBackendOption.resolved(requestConfig.meetingSummaryBackend).label, model: MeetingTextGenerationClient.model(requestConfig)) else { return }
+            guard let turn = try await worker.restartTurn(id: turnID, config: requestConfig) else {
+                if activeRequestID == reservation { activeRequestID = nil; phase = "" }; return
+            }
+            guard activeRequestID == reservation, !Task.isCancelled else {
+                try? await worker.setTurnState(id: turn.id, state: .stopped, attemptID: turn.attemptID)
+                reload(); return
+            }
             reload(); launch(turn, config: requestConfig, isDraft: turn.isDraft)
-        } catch { errorMessage = error.localizedDescription }
+        } catch {
+            if activeRequestID == reservation { activeRequestID = nil; phase = ""; errorMessage = error.localizedDescription }
+        }
     }
     private func launch(_ turn: MeetingChatTurn, config: AppConfig, isDraft: Bool) {
         let requestID = turn.attemptID ?? UUID(); activeRequestID = requestID; activeTurnID = turn.id; activeSessionID = turn.sessionID; phase = "Finding meeting context"
@@ -164,26 +274,33 @@ final class MeetingChatCoordinator {
                 guard activeRequestID == requestID else { return }
                 let stopped = Task.isCancelled || error is CancellationError
                 let message = stopped ? nil : (error is MeetingChatError || error is MeetingTextGenerationError ? error.localizedDescription : "Meeting AI request failed. Please retry or check your connection settings.")
-                try? store.setTurnState(id: turn.id, state: stopped ? .stopped : .failed, error: message, attemptID: turn.attemptID)
+                try? await worker.setTurnState(id: turn.id, state: stopped ? .stopped : .failed, error: message, attemptID: turn.attemptID)
             }
         }
     }
     func stop() {
         guard let id = activeRequestID else { return }
         tasks[id]?.cancel()
-        if let turnID = activeTurnID { try? store.setTurnState(id: turnID, state: .stopped, attemptID: id) }
-        activeRequestID = nil; activeTurnID = nil; activeSessionID = nil; phase = ""; reload()
+        if let turnID = activeTurnID {
+            let cleanupID = UUID(); let worker = worker
+            tasks[cleanupID] = Task {
+                defer { tasks.removeValue(forKey: cleanupID); reload() }
+                try? await worker.setTurnState(id: turnID, state: .stopped, attemptID: id)
+            }
+            if let index = turns.firstIndex(where: { $0.id == turnID && $0.state.isPending }) { turns[index].state = .stopped }
+        }
+        activeRequestID = nil; activeTurnID = nil; activeSessionID = nil; phase = ""
     }
-    func deleteChat(id: UUID) {
+    func deleteChat(id: UUID) async {
         if activeSessionID == id { stop() }
-        do { try store.deleteSession(id: id); reload() } catch { errorMessage = error.localizedDescription }
+        do { try await worker.deleteChat(id: id); composerDrafts[id] = nil; reload() } catch { errorMessage = error.localizedDescription }
     }
-    func saveDraft(turnID: UUID, text: String) {
-        do { try store.saveDraft(turnID: turnID, text: text); reload() } catch { errorMessage = error.localizedDescription }
+    func saveDraft(turnID: UUID, text: String) async {
+        do { try await worker.saveDraft(turnID: turnID, text: text); reload() } catch { errorMessage = error.localizedDescription }
     }
     func refreshChoices() async { do { sourceChoices = try await worker.choices() } catch { errorMessage = error.localizedDescription } }
     func source(_ id: Int64) async -> MeetingChatSourceSnapshot? { try? await worker.source(id) }
-    func waitForIdle() async { while let task = tasks.values.first { await task.value } }
+    func waitForIdle() async { await initialization?.value; while let task = tasks.values.first { await task.value } }
     func refreshForSourceChanges() {
         guard let version = try? store.sourceMutationVersion(), version != sourceMutationVersion else { return }
         sourceMutationVersion = version

@@ -155,6 +155,8 @@ case "${shard}" in
       MeetingChatClientTests
       MeetingChatNavigationTests
       MeetingChatExporterTests
+      MeetingChatNotesActionTests
+      MeetingChatReviewTests
       ClaudeCodeSummarizerTests
       MeetingsNavigationTests
       MeetingBrowserLogicTests

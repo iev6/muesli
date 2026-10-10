@@ -43,12 +43,12 @@ public struct MeetingChatStore: Sendable {
             try saveSession(session, db: db)
         } }
     }
-    public func beginTurn(sessionID: UUID, question: String, scope: MeetingChatScope, provider: String, model: String) throws -> MeetingChatTurn {
+    public func beginTurn(sessionID: UUID, question: String, scope: MeetingChatScope, provider: String, model: String, attemptID: UUID = UUID()) throws -> MeetingChatTurn {
         try connection { db in try MeetingChatSQL.transaction(db: db) {
             var session = try session(sessionID, db: db)
             let turn = MeetingChatTurn(id: UUID(), sessionID: sessionID, ordinal: try nextOrdinal(sessionID: sessionID, db: db), question: question,
                 scope: scope, state: .finding, citations: [], provider: provider, model: model,
-                attemptID: UUID(), scopeLabel: try scopeLabel(scope, db: db))
+                attemptID: attemptID, scopeLabel: try scopeLabel(scope, db: db))
             try MeetingChatSQL.execute("INSERT INTO meeting_chat_turns VALUES(?,?,?,?,?)", [.text(turn.id.uuidString), .text(sessionID.uuidString), .integer(Int64(turn.ordinal)), .text(turn.state.rawValue), .text(try MeetingChatSQL.encode(turn))], db: db)
             session.updatedAt = Date(); try saveSession(session, db: db)
             return turn

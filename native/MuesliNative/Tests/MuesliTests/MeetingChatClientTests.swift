@@ -130,7 +130,7 @@ struct MeetingChatClientTests {
     @Test @MainActor func sourceDeleteDuringAwaitCannotPersist() async throws {
         let gate = ChatReplyGate()
         let (store, coordinator, id) = try coordinatorFixture(generator: gate)
-        coordinator.createChat(scope: .init()); coordinator.send(question: "launch", config: AppConfig())
+        await coordinator.createChat(scope: .init()); await coordinator.send(question: "launch", config: AppConfig())
         await gate.waitUntilStarted()
         try store.deleteMeeting(id: id)
         await gate.finish(); await coordinator.waitForIdle()
@@ -141,10 +141,10 @@ struct MeetingChatClientTests {
     @Test @MainActor func switchChatPreservesReplyOwner() async throws {
         let gate = ChatReplyGate()
         let (store, coordinator, _) = try coordinatorFixture(generator: gate)
-        coordinator.createChat(scope: .init())
+        await coordinator.createChat(scope: .init())
         let original = try #require(coordinator.selectedSessionID)
-        coordinator.send(question: "launch", config: AppConfig()); await gate.waitUntilStarted()
-        coordinator.createChat(scope: .init())
+        await coordinator.send(question: "launch", config: AppConfig()); await gate.waitUntilStarted()
+        await coordinator.createChat(scope: .init())
         await gate.finish(); await coordinator.waitForIdle()
         #expect(coordinator.turns.isEmpty)
         #expect(try MeetingChatStore(databaseURL: store.resolvedDatabaseURL).turns(sessionID: original).first?.state == .completed)
@@ -153,14 +153,14 @@ struct MeetingChatClientTests {
     @Test @MainActor func retryReusesQuestionAndScopeChangesExcludeOldHistory() async throws {
         let probe = ChatPromptProbe()
         let (store, coordinator, id) = try coordinatorFixture(generator: probe)
-        coordinator.createChat(scope: .init()); coordinator.send(question: "launch", config: AppConfig())
+        await coordinator.createChat(scope: .init()); await coordinator.send(question: "launch", config: AppConfig())
         await coordinator.waitForIdle()
         let first = try #require(coordinator.turns.first)
-        coordinator.retry(turnID: first.id, config: AppConfig()); await coordinator.waitForIdle()
+        await coordinator.retry(turnID: first.id, config: AppConfig()); await coordinator.waitForIdle()
         #expect(coordinator.turns.count == 1)
-        coordinator.setScope(.init(selection: .meetings([id])))
-        coordinator.setScope(.init())
-        coordinator.send(question: "launch follow-up", config: AppConfig()); await coordinator.waitForIdle()
+        await coordinator.setScope(.init(selection: .meetings([id])))
+        await coordinator.setScope(.init())
+        await coordinator.send(question: "launch follow-up", config: AppConfig()); await coordinator.waitForIdle()
         let requests = await probe.requests
         #expect(!requests.last!.user.contains("HISTORICAL_ANSWER"))
         #expect(try MeetingChatStore(databaseURL: store.resolvedDatabaseURL).turns(sessionID: coordinator.selectedSessionID!).count == 2)
@@ -169,9 +169,9 @@ struct MeetingChatClientTests {
     @Test @MainActor func deletingBackgroundChatCancelsItsRequest() async throws {
         let gate = ChatReplyGate()
         let (_, coordinator, _) = try coordinatorFixture(generator: gate)
-        coordinator.createChat(scope: .init()); let original = coordinator.selectedSessionID!
-        coordinator.send(question: "launch", config: AppConfig()); await gate.waitUntilStarted()
-        coordinator.createChat(scope: .init()); coordinator.deleteChat(id: original)
+        await coordinator.createChat(scope: .init()); let original = coordinator.selectedSessionID!
+        await coordinator.send(question: "launch", config: AppConfig()); await gate.waitUntilStarted()
+        await coordinator.createChat(scope: .init()); await coordinator.deleteChat(id: original)
         #expect(!coordinator.isBusy)
         await gate.finish(); await coordinator.waitForIdle()
     }
@@ -179,9 +179,9 @@ struct MeetingChatClientTests {
     @Test @MainActor func editedSourceDoesNotBlockFreshFollowUp() async throws {
         let probe = ChatPromptProbe()
         let (store, coordinator, id) = try coordinatorFixture(generator: probe)
-        coordinator.createChat(scope: .init()); coordinator.send(question: "launch", config: AppConfig()); await coordinator.waitForIdle()
+        await coordinator.createChat(scope: .init()); await coordinator.send(question: "launch", config: AppConfig()); await coordinator.waitForIdle()
         try store.updateMeetingTranscript(id: id, rawTranscript: "Launch Monday")
-        coordinator.send(question: "launch now?", config: AppConfig()); await coordinator.waitForIdle()
+        await coordinator.send(question: "launch now?", config: AppConfig()); await coordinator.waitForIdle()
         #expect(coordinator.turns.last?.state == .completed)
         #expect(await probe.requests.count == 2)
     }
@@ -192,8 +192,8 @@ struct MeetingChatClientTests {
         let (store, coordinator, _) = try coordinatorFixture(generator: probe)
         _ = try store.insertMeeting(title: "Sunflower", calendarEventID: nil, startTime: Date(timeIntervalSince1970: 1_000), endTime: Date(timeIntervalSince1970: 1_060), rawTranscript: "The sunflower contract was approved.", formattedNotes: "", micAudioPath: nil, systemAudioPath: nil)
         for _ in 0..<300 { _ = try store.insertMeeting(title: "Routine", calendarEventID: nil, startTime: Date(), endTime: Date(), rawTranscript: "Unrelated check-in.", formattedNotes: "", micAudioPath: nil, systemAudioPath: nil) }
-        coordinator.createChat(scope: .init())
-        coordinator.send(question: question, config: AppConfig())
+        await coordinator.createChat(scope: .init())
+        await coordinator.send(question: question, config: AppConfig())
         await coordinator.waitForIdle()
         #expect(await probe.requests.last?.user.contains("The sunflower contract was approved.") == true)
     }
@@ -204,7 +204,7 @@ struct MeetingChatClientTests {
         let directory = store.resolvedDatabaseURL.deletingLastPathComponent().appendingPathComponent("chat-wipe-support-\(UUID())")
         let controller = MuesliController(runtime: RuntimePaths(repoRoot: directory, menuIcon: nil, appIcon: nil, bundlePath: nil), dictationStore: store, configStore: ConfigStore(supportDirectory: directory))
         controller.meetingChatCoordinator = coordinator
-        coordinator.createChat(scope: .init()); coordinator.send(question: "launch", config: AppConfig())
+        await coordinator.createChat(scope: .init()); await coordinator.send(question: "launch", config: AppConfig())
         await gate.waitUntilStarted()
         controller.clearMeetingHistory()
         #expect(!coordinator.isBusy)
@@ -219,8 +219,8 @@ struct MeetingChatClientTests {
         _ = try store.insertMeeting(title: "Launch", calendarEventID: nil, startTime: Date(), endTime: Date(), rawTranscript: "Launch Friday", formattedNotes: "", micAudioPath: nil, systemAudioPath: nil)
         let gate = ChatReplyGate()
         let coordinator = MeetingChatCoordinator(databaseURL: url, generator: gate)
-        coordinator.createChat(scope: .init())
-        coordinator.send(question: "launch", config: AppConfig())
+        await coordinator.createChat(scope: .init())
+        await coordinator.send(question: "launch", config: AppConfig())
         await gate.waitUntilStarted()
         coordinator.stop()
         await gate.finish()

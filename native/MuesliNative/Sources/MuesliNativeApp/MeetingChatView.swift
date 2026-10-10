@@ -34,7 +34,7 @@ struct MeetingChatView: View {
             HStack {
                 Button { showHistory = !historyIsVisible } label: { Image(systemName: "sidebar.left") }.help("Toggle chat history")
                 Text("Ask Meetings").font(MuesliTheme.title2()); Spacer()
-                Button("New Chat", systemImage: "plus") { coordinator.createChat(scope: .init()); composerFocused = true }
+                Button("New Chat", systemImage: "plus") { Task { await coordinator.createChat(scope: .init()); composerFocused = true } }.disabled(coordinator.isUpdatingChat)
             }.padding(24)
             Divider()
             HStack(spacing: 0) {
@@ -50,7 +50,7 @@ struct MeetingChatView: View {
                 }
                 VStack(alignment: .leading, spacing: 0) {
                     HStack {
-                        Button(scopeLabel, systemImage: "line.3.horizontal.decrease") { showScope = true }.accessibilityIdentifier("meeting-chat-scope")
+                        Button(scopeLabel, systemImage: "line.3.horizontal.decrease") { showScope = true }.disabled(coordinator.isUpdatingChat).accessibilityIdentifier("meeting-chat-scope")
                         if let start = coordinator.scope.startDate { Text("From \(start.formatted(date: .abbreviated, time: .omitted))").font(.caption) }
                         if let end = coordinator.scope.endDateExclusive { Text("through \(end.addingTimeInterval(-0.001).formatted(date: .abbreviated, time: .omitted))").font(.caption) }
                         Spacer()
@@ -77,8 +77,8 @@ struct MeetingChatView: View {
             }
         }
         .background(MuesliTheme.backgroundBase)
-        .sheet(isPresented: $showScope) { MeetingChatScopePicker(scope: coordinator.scope, folders: appState.folders, meetings: coordinator.sourceChoices, onChange: coordinator.setScope) }
-        .sheet(item: $editingDraft) { turn in MeetingChatDraftView(turn: turn) { coordinator.saveDraft(turnID: turn.id, text: $0) } }
+        .sheet(isPresented: $showScope) { MeetingChatScopePicker(scope: coordinator.scope, folders: appState.folders, meetings: coordinator.sourceChoices) { scope in Task { await coordinator.setScope(scope) } } }
+        .sheet(item: $editingDraft) { turn in MeetingChatDraftView(turn: turn) { text in Task { await coordinator.saveDraft(turnID: turn.id, text: text) } } }
         .popover(item: $citation) { source in
             MeetingChatCitationView(citation: source, coordinator: coordinator) {
                 guard let sessionID = coordinator.selectedSessionID else { return }
@@ -86,17 +86,17 @@ struct MeetingChatView: View {
             }
         }
         .alert("Delete this chat?", isPresented: Binding(get: { deletingChat != nil }, set: { if !$0 { deletingChat = nil } })) {
-            Button("Delete", role: .destructive) { if let id = deletingChat { coordinator.deleteChat(id: id) }; deletingChat = nil }
+            Button("Delete", role: .destructive) { if let id = deletingChat { Task { await coordinator.deleteChat(id: id) } }; deletingChat = nil }
             Button("Cancel", role: .cancel) { deletingChat = nil }
         }
         .alert("Rename chat", isPresented: Binding(get: { renamingChat != nil }, set: { if !$0 { renamingChat = nil } })) {
             TextField("Chat title", text: $newTitle)
-            Button("Save") { if let id = renamingChat, !newTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { coordinator.renameChat(id: id, title: newTitle) }; renamingChat = nil }
+            Button("Save") { if let id = renamingChat, !newTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { let title = newTitle; Task { await coordinator.renameChat(id: id, title: title) } }; renamingChat = nil }
             Button("Cancel", role: .cancel) { renamingChat = nil }
         }
         .alert("Whose next steps?", isPresented: $participantPrompt) {
             TextField("Participant name", text: $participantName)
-            Button("Prepare question") { prepare(.myNextSteps, name: participantName) }.disabled(participantName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            Button("Prepare question") { let name = participantName; Task { await prepare(.myNextSteps, name: name) } }.disabled(participantName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             Button("Cancel", role: .cancel) { }
         }
         .onChange(of: coordinator.selectedSessionID) { _, _ in citation = nil; preparedIsDraft = false }
@@ -112,7 +112,7 @@ struct MeetingChatView: View {
     private var composer: some View {
         VStack(alignment: .leading, spacing: 10) {
             ScrollView(.horizontal, showsIndicators: false) {
-                HStack { ForEach(MeetingChatQuickAction.allCases) { action in Button(action.label) { prepare(action, name: nil) }.disabled(coordinator.isBusy) } }
+                HStack { ForEach(MeetingChatQuickAction.allCases) { action in Button(action.label) { let name = appState.config.userName; Task { await prepare(action, name: name) } }.disabled(coordinator.isBusy || coordinator.isUpdatingChat) } }
             }
             HStack {
                 Toggle("Fast answers", isOn: $coordinator.fastAnswers).toggleStyle(.checkbox).help("Uses GPT-5.4 Mini for ChatGPT/OpenAI. Other providers keep their configured model.")
@@ -126,17 +126,23 @@ struct MeetingChatView: View {
                 Text(coordinator.isBusy ? coordinator.phase : "Enter to send · Shift+Enter for a new line").font(.caption).foregroundStyle(.secondary)
                 Spacer()
                 if coordinator.isBusy { ProgressView().controlSize(.small); Button("Stop") { coordinator.stop() } }
-                else { Button("Send", systemImage: "arrow.up") { send() }.buttonStyle(.borderedProminent).disabled(coordinator.composerDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) }
+                else { Button("Send", systemImage: "arrow.up") { send() }.buttonStyle(.borderedProminent).disabled(coordinator.isUpdatingChat || coordinator.composerDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) }
             }
         }.padding(16)
     }
     private func send() {
+        guard !coordinator.isBusy, !coordinator.isUpdatingChat else { return }
         guard controller.canUseSummaryProvider(MeetingSummaryBackendOption.resolved(requestConfig.meetingSummaryBackend)) else {
             coordinator.errorMessage = "Connect your meeting AI provider in AI Settings. Your question is saved here."; return
         }
-        coordinator.send(question: coordinator.composerDraft, config: appState.config, isDraft: preparedIsDraft)
+        let question = coordinator.composerDraft; let config = appState.config; let draft = preparedIsDraft; let sessionID = coordinator.selectedSessionID
+        Task {
+            guard coordinator.selectedSessionID == sessionID else { return }
+            await coordinator.send(question: question, config: config, isDraft: draft)
+            if coordinator.selectedSessionID == sessionID { scrollAnchor.wrappedValue = coordinator.turns.last?.id }
+            else if let turnID = coordinator.activeTurnID, coordinator.turns.contains(where: { $0.id == turnID }) { scrollAnchor.wrappedValue = turnID }
+        }
         preparedIsDraft = false
-        scrollAnchor.wrappedValue = coordinator.turns.last?.id
     }
     @ViewBuilder private func turnView(_ turn: MeetingChatTurn) -> some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -171,15 +177,15 @@ struct MeetingChatView: View {
             else if turn.state.isPending { Text("\(turn.state == .finding ? "Finding meeting context" : "Writing answer")…").foregroundStyle(.secondary) }
             else {
                 Text(turn.error ?? (turn.state == .stopped ? "Request stopped" : "Request interrupted")).foregroundStyle(.orange)
-                Button("Retry") { coordinator.retry(turnID: turn.id, config: appState.config) }.disabled(coordinator.isBusy)
+                Button("Retry") { let config = appState.config; Task { await coordinator.retry(turnID: turn.id, config: config) } }.disabled(coordinator.isBusy || coordinator.isUpdatingChat)
             }
         }.frame(maxWidth: .infinity, alignment: .leading)
     }
-    private func prepare(_ action: MeetingChatQuickAction, name: String?) {
+    private func prepare(_ action: MeetingChatQuickAction, name: String?) async {
         let prompt = action.prepare(scope: coordinator.scope, now: Date(), calendar: .current, userDisplayName: name)
         if prompt.needsParticipantName { participantName = ""; participantPrompt = true; return }
-        if prompt.scope != coordinator.scope { coordinator.setScope(prompt.scope) }
-        coordinator.composerDraft = prompt.text; preparedIsDraft = prompt.isDraft; composerFocused = true
+        guard await coordinator.applyPreparedPrompt(prompt) else { return }
+        preparedIsDraft = prompt.isDraft; composerFocused = true
     }
     static func attributedAnswer(_ raw: String, citations: [MeetingChatCitation]) -> AttributedString {
         var markdown = MeetingChatClient.displayText(raw)

@@ -15,9 +15,9 @@ struct MeetingChatNavigationTests {
         let evidence = try MeetingChatRetrieval(databaseURL: store.resolvedDatabaseURL).retrieve(question: "Friday", scope: .init())
         return (controller, store, try #require(evidence.passages.first { $0.kind == .transcript }?.citation))
     }
-    @Test func entryUsesSingleMeetingScopeAndReturnPreservesComposer() throws {
+    @Test func entryUsesSingleMeetingScopeAndReturnPreservesComposer() async throws {
         let (controller, _, citation) = try controllerFixture()
-        controller.showMeetingChat(meetingID: citation.meetingID)
+        await controller.showMeetingChat(meetingID: citation.meetingID)?.value
         let chat = controller.meetingChatCoordinator
         #expect(controller.appState.selectedTab == .meetingChat)
         #expect(chat.scope.selection == .meetings([citation.meetingID]))
@@ -30,14 +30,14 @@ struct MeetingChatNavigationTests {
         #expect(chat.selectedSessionID == sessionID)
         #expect(chat.composerDraft == "Follow-up draft")
     }
-    @Test func sourceLocatorValidatesOffsetsAndHandlesChangedPassages() throws {
+    @Test func sourceLocatorValidatesOffsetsAndHandlesChangedPassages() async throws {
         let (_, _, citation) = try controllerFixture()
         let target = MeetingChatDocumentTarget(citation: citation, sessionID: UUID())
         #expect(target.locate(in: "[00:00:01] You: Launch Friday.") != nil)
         #expect(target.locate(in: "Unrelated new transcript") == nil)
         #expect(target.locate(in: "Preface\n[00:00:01] You: Launch Friday.")?.location == 8)
     }
-    @Test func noteCitationTargetsNotesAndMissingMeetingDoesNotNavigate() throws {
+    @Test func noteCitationTargetsNotesAndMissingMeetingDoesNotNavigate() async throws {
         let (controller, store, original) = try controllerFixture()
         var citation = original; citation.kind = .generatedNotes; citation.timestamp = nil
         let target = MeetingChatDocumentTarget(citation: citation, sessionID: UUID())
@@ -46,7 +46,7 @@ struct MeetingChatNavigationTests {
         controller.showMeetingChatSource(target)
         #expect(controller.appState.meetingChatDocumentTarget == nil)
     }
-    @Test func selectionChoicesLoadFullArchiveWithoutTranscriptPayloads() throws {
+    @Test func selectionChoicesLoadFullArchiveWithoutTranscriptPayloads() async throws {
         let (_, store, _) = try controllerFixture()
         _ = try MeetingChatRetrieval(databaseURL: store.resolvedDatabaseURL).prepareIndex()
         let choices = try MeetingChatStore(databaseURL: store.resolvedDatabaseURL).sourceChoices()
@@ -54,9 +54,9 @@ struct MeetingChatNavigationTests {
         #expect(choices.first?.title == "Launch")
     }
 
-    @Test func sourceDeletionRefreshesDisplayedAnswersImmediately() throws {
+    @Test func sourceDeletionRefreshesDisplayedAnswersImmediately() async throws {
         let (controller, _, citation) = try controllerFixture()
-        controller.showMeetingChat(meetingID: citation.meetingID)
+        await controller.showMeetingChat(meetingID: citation.meetingID)?.value
         let coordinator = controller.meetingChatCoordinator
         let sessionID = coordinator.selectedSessionID!
         let turn = try coordinator.store.beginTurn(sessionID: sessionID, question: "When?", scope: coordinator.scope, provider: "test", model: "test")
@@ -77,7 +77,7 @@ struct MeetingChatNavigationTests {
         #expect(MeetingChatDocumentTarget.transcriptMessageID(in: text, range: repeated) == 2)
     }
 
-    @Test func historicalScopeLabelsRetainFolderNameAndBothDateBounds() throws {
+    @Test func historicalScopeLabelsRetainFolderNameAndBothDateBounds() async throws {
         let (_, store, _) = try controllerFixture()
         let folder = try store.createFolder(name: "Original project")
         let chat = MeetingChatStore(databaseURL: store.resolvedDatabaseURL)
@@ -88,9 +88,9 @@ struct MeetingChatNavigationTests {
         #expect(turn.scopeLabel?.contains("through") == true)
     }
 
-    @Test func sourceReturnRetainsSessionScrollAnchor() throws {
+    @Test func sourceReturnRetainsSessionScrollAnchor() async throws {
         let (controller, _, citation) = try controllerFixture()
-        controller.showMeetingChat(meetingID: citation.meetingID)
+        await controller.showMeetingChat(meetingID: citation.meetingID)?.value
         let coordinator = controller.meetingChatCoordinator
         let session = coordinator.selectedSessionID!
         let anchor = UUID()
@@ -100,25 +100,25 @@ struct MeetingChatNavigationTests {
         #expect(coordinator.scrollAnchors[session] == anchor)
     }
 
-    @Test func emptyMeetingDetailDoesNotRequireACitationTarget() throws {
+    @Test func emptyMeetingDetailDoesNotRequireACitationTarget() async throws {
         let (controller, _, _) = try controllerFixture()
         let view = MeetingDetailView(meeting: nil, controller: controller, appState: controller.appState)
         #expect(view.meeting == nil)
     }
 
-    @Test func historyPanelIgnoresBlankChatsAndTracksLastConversationDeletion() throws {
+    @Test func historyPanelIgnoresBlankChatsAndTracksLastConversationDeletion() async throws {
         let (controller, _, _) = try controllerFixture()
         let coordinator = controller.meetingChatCoordinator
         #expect(!coordinator.hasChatHistory)
-        coordinator.createChat(scope: .init())
+        await coordinator.createChat(scope: .init())
         let session = try #require(coordinator.selectedSessionID)
         #expect(!coordinator.hasChatHistory)
         _ = try coordinator.store.beginTurn(sessionID: session, question: "When is launch?", scope: .init(), provider: "test", model: "test")
         coordinator.reload()
         #expect(coordinator.hasChatHistory)
-        coordinator.createChat(scope: .init())
+        await coordinator.createChat(scope: .init())
         #expect(coordinator.hasChatHistory)
-        coordinator.deleteChat(id: session)
+        await coordinator.deleteChat(id: session)
         #expect(!coordinator.hasChatHistory)
     }
 }
